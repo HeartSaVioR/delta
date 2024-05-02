@@ -1891,3 +1891,173 @@ trait GeneratedColumnSuiteBase
 
 class GeneratedColumnSuite extends GeneratedColumnSuiteBase
 
+class StreamingQueryMetricsWithGeneratedColumnSuite extends GeneratedColumnTest {
+  // FIXME: below tests are broken due to the fact how generated column is implemented in Delta
+  //  tl;dr. it is crazy hacky.
+
+  import org.scalatest.time.SpanSugar._
+
+  import org.apache.spark.sql.functions.{count, expr, window}
+
+  import testImplicits._
+
+  test("Verify delta generated columns and observed metrics") {
+    withTempDir { tempDir =>
+      val checkpointDir: String = s"$tempDir/chkpoint"
+
+      val srcTbl = "srcTable"
+      val destTbl = "destTable"
+
+      withTable(srcTbl, destTbl) {
+        sql(
+          s"""
+             | CREATE OR REPLACE TABLE $srcTbl USING delta AS (SELECT id AS n FROM RANGE(10));
+             |""".stripMargin)
+
+        createTable(destTbl, None, "n LONG, m LONG", Map("m" -> "n + 100"), Seq.empty)
+
+        val query = spark
+          .readStream
+          .format("delta")
+          .table(srcTbl)
+          .observe("tgtCount", count("*"))
+          .writeStream
+          .option("checkpointLocation", checkpointDir)
+          .trigger(Trigger.Once)
+          .format("delta")
+          .toTable(destTbl)
+
+        query.awaitTermination()
+        // capture custom metrics from progress and check that 10 rows are changed.
+        val rowVal = query.lastProgress.observedMetrics.get("tgtCount")
+        assert(rowVal === Row(10))
+      }
+    }
+  }
+
+  test("Verify delta generated columns for numInputRows with DSv1 source") {
+    withTempDir { tempDir =>
+      val checkpointDir: String = s"$tempDir/chkpoint"
+
+      val srcTbl = "srcTable"
+      val destTbl = "destTable"
+
+      withTable(srcTbl, destTbl) {
+        sql(
+          s"""
+             | CREATE OR REPLACE TABLE $srcTbl USING delta AS (SELECT id AS n FROM RANGE(10));
+             |""".stripMargin)
+
+        createTable(destTbl, None, "n LONG, m LONG", Map("m" -> "n + 100"), Seq.empty)
+
+        val query = spark
+          .readStream
+          .format("delta")
+          .table(srcTbl)
+          .writeStream
+          .option("checkpointLocation", checkpointDir)
+          .trigger(Trigger.Once)
+          .format("delta")
+          .toTable(destTbl)
+
+        query.awaitTermination()
+        assert(query.lastProgress.numInputRows > 0)
+      }
+    }
+  }
+
+  test("Verify delta generated columns for numInputRows with DSv2 source") {
+    withTempDir { checkpointDir =>
+      val destTbl = "destTable_" + System.currentTimeMillis().toString
+
+      createTable(destTbl, None, "mod BIGINT, count BIGINT", Map("countGen" -> "count + 10"),
+        Seq.empty)
+
+      spark.conf.set("spark.default.parallelism", 20)
+      spark.conf.set("spark.sql.shuffle.partitions", 20)
+
+      val rateStream = spark
+        .readStream
+        .format("rate")
+        .option("numPartitions", 1)
+        .option("rowsPerSecond", 10)
+        .load()
+
+      val countsStream = rateStream
+        .withWatermark("timestamp", "30 seconds")
+        .groupBy(window($"timestamp", "30 seconds",
+          "15 seconds"), expr("MOD(value, 100)").as("mod")).count()
+
+      val query = countsStream
+        .select("mod", "count")
+        .writeStream
+        .format("delta")
+        .outputMode("append")
+        .option("checkpointLocation", checkpointDir.getCanonicalPath)
+        .toTable(destTbl)
+
+      try {
+        eventually(timeout(10.seconds)) {
+          assert(query.lastProgress.numInputRows > 0)
+        }
+      } finally {
+        query.stop()
+        query.awaitTermination()
+      }
+    }
+  }
+
+  test("Verify delta generated columns and watermarking") {
+    withTempDir { checkpointDir =>
+      val destTbl = "destTable"
+
+      createTable(destTbl, None, "start TIMESTAMP, end TIMESTAMP, count LONG, genCount LONG",
+        Map("genCount" -> "count + 100"), Seq.empty)
+
+      val inputData = MemoryStream[Long]
+      val inputDF = inputData.toDF.toDF("time")
+      val outputDf = inputDF
+        .selectExpr("CAST(time AS timestamp) AS timestamp")
+        .withWatermark("timestamp", "10 seconds")
+        .groupBy(window($"timestamp", "5 seconds"))
+        .count()
+        .select("window.start", "window.end", "count")
+
+      val query =
+        outputDf.writeStream
+          .option("checkpointLocation", checkpointDir.getCanonicalPath)
+          .format("delta")
+          .toTable(destTbl)
+      try {
+        def addTimestamp(timestampInSecs: Int*): Unit = {
+          inputData.addData(timestampInSecs.map(_ * 1L): _*)
+          failAfter(60.seconds) {
+            query.processAllAvailable()
+          }
+        }
+
+        def check(expectedResult: ((Long, Long), Long)*): Unit = {
+          val outputDf = spark.read.format("delta").table(destTbl)
+            .selectExpr(
+              "CAST(start as BIGINT) AS start",
+              "CAST(end as BIGINT) AS end",
+              "count")
+          checkDatasetUnorderly(
+            outputDf.as[(Long, Long, Long)],
+            expectedResult.map(x => (x._1._1, x._1._2, x._2)): _*)
+        }
+
+        addTimestamp(100) // watermark = None before this, watermark = 100 - 10 = 90 after this
+        addTimestamp(104, 123) // watermark = 90 before this, watermark = 123 - 10 = 113 after this
+
+        addTimestamp(140) // wm = 113 before this, emit results on 100-105, wm = 130 after this
+        check((100L, 105L) -> 2L, (120L, 125L) -> 1L) // no-data-batch emits results on 120-125
+
+      } finally {
+        if (query != null) {
+          query.stop()
+        }
+      }
+    }
+  }
+}
